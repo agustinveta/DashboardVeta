@@ -1525,10 +1525,34 @@ function renderDivCharts(d) {
 // ─── NAVIGATION ────────────────────────────────────────────────────────────
 
 // ─── SECTION: ACUMULADO TOTAL ──────────────────────────────────────────────
+function calcAcuClientMetrics() {
+  const years = [2024, 2025, 2026];
+  // Build unified client presence across all years (concatenated months)
+  const allClients = [...new Set(years.flatMap(y => Object.keys(DATA[y].clientes)))];
+  const result = {};
+  allClients.forEach(c => {
+    let totalRevenue = 0, activeMonths = 0, churnCount = 0, presenceHistory = [];
+    years.forEach(y => {
+      const presence = DATA[y].clientes[c] || [];
+      const rev = DATA[y].ingresoClientes[c] || 0;
+      totalRevenue += rev;
+      activeMonths += presence.filter(v => v > 0).length;
+      presenceHistory = presenceHistory.concat(presence);
+    });
+    // Churn = times went from active to inactive across full history
+    for (let i = 1; i < presenceHistory.length; i++) {
+      if (presenceHistory[i-1] > 0 && presenceHistory[i] === 0) churnCount++;
+    }
+    const avgMonthly = activeMonths > 0 ? totalRevenue / activeMonths : 0;
+    const isCurrentlyActive = (DATA[2026].clientes[c] || [])[DATA[2026].meses.length - 1] > 0;
+    result[c] = { totalRevenue, activeMonths, avgMonthly, ltv: totalRevenue, mrr: avgMonthly, churnCount, isCurrentlyActive };
+  });
+  return result;
+}
+
 function buildAcumulado() {
   const years = [2024, 2025, 2026];
 
-  // Merge all months across years with year prefix
   const allMeses    = years.flatMap(y => DATA[y].meses.map(m => m + ' ' + String(y).slice(2)));
   const allIngresos = years.flatMap(y => DATA[y].ingresos);
   const allCostos   = years.flatMap(y => DATA[y].costos);
@@ -1546,34 +1570,80 @@ function buildAcumulado() {
   const avgMrg    = Math.round(allMargen.filter(v=>v>0).reduce((a,b)=>a+b,0) / allMargen.filter(v=>v>0).length);
   const totalMeses = allMeses.length;
 
-  // Cumulative ingreso line
-  let cumSum = 0;
-  const cumIngresos = allIngresos.map(v => { cumSum += v; return cumSum; });
+  // Client metrics across all years
+  const cliMetrics = calcAcuClientMetrics();
+  const allClients = Object.keys(cliMetrics);
+  const sortedByLTV = [...allClients].sort((a,b) => cliMetrics[b].ltv - cliMetrics[a].ltv);
 
-  // All clients ever across all years (deduplicated, sum revenue)
-  const clientMap = {};
-  years.forEach(y => {
-    Object.entries(DATA[y].ingresoClientes).forEach(([c, v]) => {
-      clientMap[c] = (clientMap[c] || 0) + v;
+  // MRR = sum of MRR of currently active clients
+  const activeClients = allClients.filter(c => cliMetrics[c].isCurrentlyActive);
+  const totalMRR = activeClients.reduce((a,c) => a + cliMetrics[c].mrr, 0);
+  const avgLTV   = allClients.length ? allClients.reduce((a,c)=>a+cliMetrics[c].ltv,0) / allClients.length : 0;
+  const totalLTV = allClients.reduce((a,c)=>a+cliMetrics[c].ltv,0);
+  const totalChurns = allClients.reduce((a,c)=>a+cliMetrics[c].churnCount,0);
+  const avgLifespan = allClients.length ? allClients.reduce((a,c)=>a+cliMetrics[c].activeMonths,0) / allClients.length : 0;
+
+  // MRR evolution: sum of avg monthly revenue of clients active each month
+  const mrrEvolution = allMeses.map((_, globalIdx) => {
+    let monthMRR = 0;
+    let offset = 0;
+    years.forEach(y => {
+      const d = DATA[y];
+      const localIdx = globalIdx - offset;
+      if (localIdx >= 0 && localIdx < d.meses.length) {
+        Object.keys(d.clientes).forEach(c => {
+          if (d.clientes[c][localIdx] > 0) {
+            monthMRR += cliMetrics[c] ? cliMetrics[c].mrr : 0;
+          }
+        });
+      }
+      offset += d.meses.length;
     });
+    return Math.round(monthMRR);
   });
-  const sortedClients = Object.entries(clientMap).sort((a,b)=>b[1]-a[1]);
-  const totalCliRev   = Object.values(clientMap).reduce((a,b)=>a+b,0);
 
-  // Dividends per socio across all years
+  // Monthly churn rate across concatenated history
+  const allPresenceByClient = {};
+  allClients.forEach(c => {
+    allPresenceByClient[c] = years.flatMap(y => DATA[y].clientes[c] || Array(DATA[y].meses.length).fill(0));
+  });
+  const churnRatesAcu = allMeses.slice(1).map((_, i) => {
+    const prevActive = allClients.filter(c => allPresenceByClient[c][i] > 0).length;
+    const lost = allClients.filter(c => allPresenceByClient[c][i] > 0 && allPresenceByClient[c][i+1] === 0).length;
+    return prevActive > 0 ? Math.round(lost / prevActive * 100) : 0;
+  });
+  const avgChurnRate = churnRatesAcu.length ? Math.round(churnRatesAcu.reduce((a,b)=>a+b,0)/churnRatesAcu.length) : 0;
+
+  // Divs per socio
   const divSocios = {};
   years.forEach(y => {
-    Object.entries(DATA[y].dividendos).forEach(([s, arr]) => {
-      divSocios[s] = (divSocios[s] || 0) + sum(arr);
-    });
+    Object.entries(DATA[y].dividendos).forEach(([s, arr]) => { divSocios[s] = (divSocios[s]||0) + sum(arr); });
   });
 
+  // Client table rows
+  const tableRows = sortedByLTV.map((c, i) => {
+    const m = cliMetrics[c];
+    const badge = m.isCurrentlyActive
+      ? `<span style="background:rgba(29,158,117,.15);color:#9FE1CB;border:0.5px solid rgba(29,158,117,.3);padding:2px 8px;border-radius:10px;font-size:11px">Activo</span>`
+      : `<span style="background:var(--bg3);color:var(--text3);border:0.5px solid var(--border);padding:2px 8px;border-radius:10px;font-size:11px">Inactivo</span>`;
+    const maxLTV = cliMetrics[sortedByLTV[0]].ltv;
+    const bar = `<div style="height:3px;background:var(--border);border-radius:2px;margin-top:4px"><div style="height:3px;background:${CLIENT_COLORS[i%CLIENT_COLORS.length]};border-radius:2px;width:${Math.round(m.ltv/maxLTV*100)}%"></div></div>`;
+    return `<tr>
+      <td><span style="color:${CLIENT_COLORS[i%CLIENT_COLORS.length]};font-weight:500">●</span> ${c}</td>
+      <td>${badge}</td>
+      <td style="text-align:right">${m.activeMonths}m</td>
+      <td style="text-align:right;color:var(--text)">${fmt(m.mrr)}</td>
+      <td style="text-align:right;color:var(--text)">${fmt(m.ltv)}${bar}</td>
+      <td style="text-align:right;color:${m.churnCount>0?'var(--coral)':'var(--text3)'}">${m.churnCount > 0 ? m.churnCount+'x' : '—'}</td>
+    </tr>`;
+  }).join('');
+
   return `
-    <div style="margin-bottom:6px">
-      <p style="font-size:13px;color:var(--text2)">Suma de todos los períodos registrados — Jul 2024 a la fecha · ${totalMeses} meses</p>
+    <div style="margin-bottom:14px">
+      <p style="font-size:13px;color:var(--text2)">Suma de todos los períodos registrados — Jul 2024 a la fecha · ${totalMeses} meses · ${allClients.length} clientes únicos</p>
     </div>
 
-    <div class="kpi-row" style="margin-bottom:20px">
+    <div class="kpi-row" style="margin-bottom:14px">
       <div class="kpi">
         <div class="kpi-label">Ingresos totales</div>
         <div class="kpi-val">${fmt(totalIng)}</div>
@@ -1585,11 +1655,6 @@ function buildAcumulado() {
         <div class="kpi-sub">Antes de dividendos</div>
       </div>
       <div class="kpi">
-        <div class="kpi-label">Costos operativos</div>
-        <div class="kpi-val">${fmt(totalCost)}</div>
-        <div class="kpi-sub">${pct(Math.round(totalCost/totalIng*100))} de ingresos</div>
-      </div>
-      <div class="kpi">
         <div class="kpi-label">Margen promedio</div>
         <div class="kpi-val">${pct(avgMrg)}</div>
         <div class="kpi-sub">Neto operativo</div>
@@ -1597,18 +1662,57 @@ function buildAcumulado() {
       <div class="kpi">
         <div class="kpi-label">Dividendos totales</div>
         <div class="kpi-val">${fmt(totalDiv)}</div>
-        <div class="kpi-sub">${Object.keys(divSocios).join(' + ')}</div>
+        <div class="kpi-sub">${pct(Math.round(totalDiv/totalRes*100))} del resultado</div>
+      </div>
+    </div>
+
+    <div class="kpi-row" style="margin-bottom:20px">
+      <div class="kpi">
+        <div class="kpi-label">MRR actual</div>
+        <div class="kpi-val">${fmt(totalMRR)}</div>
+        <div class="kpi-sub">${activeClients.length} clientes activos · ${fmt(activeClients.length ? totalMRR/activeClients.length : 0)}/cliente</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">LTV total acumulado</div>
+        <div class="kpi-val">${fmt(totalLTV)}</div>
+        <div class="kpi-sub">${allClients.length} clientes únicos</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">LTV promedio</div>
+        <div class="kpi-val">${fmt(avgLTV)}</div>
+        <div class="kpi-sub">Por cliente histórico</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Churn rate promedio</div>
+        <div class="kpi-val">${avgChurnRate}%</div>
+        <div class="kpi-sub">${totalChurns} evento${totalChurns!==1?'s':''} de churn total</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Vida promedio</div>
+        <div class="kpi-val">${avgLifespan.toFixed(1)}m</div>
+        <div class="kpi-sub">Meses activos por cliente</div>
       </div>
     </div>
 
     <div class="grid-2" style="margin-bottom:14px">
       <div class="card">
         <div class="card-title">Ingresos mensuales — histórico completo</div>
-        <div class="chart-wrap h220"><canvas id="c-acu-bar" role="img" aria-label="Ingresos históricos completos"></canvas></div>
+        <div class="chart-wrap h200"><canvas id="c-acu-bar" role="img" aria-label="Ingresos históricos completos"></canvas></div>
       </div>
       <div class="card">
+        <div class="card-title">MRR mensual — evolución histórica</div>
+        <div class="chart-wrap h200"><canvas id="c-acu-mrr" role="img" aria-label="MRR histórico"></canvas></div>
+      </div>
+    </div>
+
+    <div class="grid-2" style="margin-bottom:14px">
+      <div class="card">
         <div class="card-title">Ingresos acumulados — curva de crecimiento</div>
-        <div class="chart-wrap h220"><canvas id="c-acu-cum" role="img" aria-label="Curva de ingresos acumulados"></canvas></div>
+        <div class="chart-wrap h180"><canvas id="c-acu-cum" role="img" aria-label="Curva de ingresos acumulados"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Churn rate mensual — histórico</div>
+        <div class="chart-wrap h180"><canvas id="c-acu-churn" role="img" aria-label="Churn rate histórico"></canvas></div>
       </div>
     </div>
 
@@ -1627,19 +1731,35 @@ function buildAcumulado() {
       </div>
     </div>
 
+    <div class="card" style="margin-bottom:14px">
+      <div class="card-title">Tabla LTV · MRR · Churn — todos los clientes históricos</div>
+      <div style="overflow-x:auto">
+        <table class="compare-table" style="min-width:520px">
+          <thead><tr>
+            <th>Cliente</th><th>Estado</th>
+            <th style="text-align:right">Meses</th>
+            <th style="text-align:right">MRR avg</th>
+            <th style="text-align:right">LTV total</th>
+            <th style="text-align:right">Churns</th>
+          </tr></thead>
+          <tbody>${tableRows}</tbody>
+        </table>
+      </div>
+    </div>
+
     <div class="grid-2">
       <div class="card">
-        <div class="card-title">Revenue total por cliente — todos los años</div>
-        <div class="chart-wrap h${Math.max(200, sortedClients.length * 30)}"><canvas id="c-acu-cli" role="img" aria-label="Revenue total por cliente histórico"></canvas></div>
+        <div class="card-title">LTV por cliente — histórico</div>
+        <div class="chart-wrap h${Math.max(200, sortedByLTV.length * 28)}"><canvas id="c-acu-cli" role="img" aria-label="LTV por cliente histórico"></canvas></div>
       </div>
       <div class="card">
         <div class="card-title">Dividendos acumulados por socio</div>
         <div style="display:flex;align-items:center;gap:16px;margin-top:8px">
-          <div style="position:relative;width:140px;height:140px;flex-shrink:0;">
+          <div style="position:relative;width:130px;height:130px;flex-shrink:0;">
             <canvas id="c-acu-div-donut" role="img" aria-label="Dividendos por socio"></canvas>
           </div>
           <div>
-            ${Object.entries(divSocios).map(([s,v],i)=>`
+            ${Object.entries(divSocios).map(([s,v])=>`
               <div style="margin-bottom:12px">
                 <div style="font-size:12px;color:var(--text2)">${s}</div>
                 <div style="font-size:20px;font-weight:600;color:var(--text)">${fmt(v)}</div>
@@ -1660,7 +1780,6 @@ function renderAcumuladoCharts() {
   const years = [2024, 2025, 2026];
   const allMeses    = years.flatMap(y => DATA[y].meses.map(m => m + "'" + String(y).slice(2)));
   const allIngresos = years.flatMap(y => DATA[y].ingresos);
-  const allCostos   = years.flatMap(y => DATA[y].costos);
   const allRes      = years.flatMap(y => DATA[y].resultado);
   const allMargen   = years.flatMap(y => DATA[y].margen);
   const allDivs     = years.flatMap(y => {
@@ -1668,71 +1787,99 @@ function renderAcumuladoCharts() {
     return DATA[y].meses.map((_,i) => socios.reduce((a,s)=>a+(s[i]||0),0));
   });
 
-  // Color bands per year
   const yearColors = { 2024: COLORS.gray, 2025: COLORS.blue, 2026: COLORS.green };
   const barColors  = years.flatMap(y => DATA[y].meses.map(() => yearColors[y]));
 
-  // Cumulative
   let cum = 0;
   const cumLine = allIngresos.map(v => { cum += v; return cum; });
+
+  const cliMetrics = calcAcuClientMetrics();
+  const allClients = Object.keys(cliMetrics);
+
+  // MRR per month
+  const mrrEvolution = allMeses.map((_, gi) => {
+    let monthMRR = 0, offset = 0;
+    years.forEach(y => {
+      const d = DATA[y];
+      const li = gi - offset;
+      if (li >= 0 && li < d.meses.length) {
+        Object.keys(d.clientes).forEach(c => {
+          if (d.clientes[c][li] > 0 && cliMetrics[c]) monthMRR += cliMetrics[c].mrr;
+        });
+      }
+      offset += d.meses.length;
+    });
+    return Math.round(monthMRR);
+  });
+
+  // Churn rate per month
+  const allPresence = {};
+  allClients.forEach(c => {
+    allPresence[c] = years.flatMap(y => DATA[y].clientes[c] || Array(DATA[y].meses.length).fill(0));
+  });
+  const churnRates = allMeses.slice(1).map((_, i) => {
+    const prevActive = allClients.filter(c => allPresence[c][i] > 0).length;
+    const lost = allClients.filter(c => allPresence[c][i] > 0 && allPresence[c][i+1] === 0).length;
+    return prevActive > 0 ? Math.round(lost / prevActive * 100) : 0;
+  });
 
   const baseOpts = {
     responsive: true, maintainAspectRatio: false,
     plugins: { legend:{display:false}, tooltip:{ backgroundColor:'#1e1e1e', titleColor:'#f0f0f0', bodyColor:'#888', borderColor:'#333', borderWidth:0.5, padding:10 } },
   };
+  const xAxis = { ticks:{color:'#555',font:{size:9},maxRotation:60,autoSkip:true,maxTicksLimit:20}, grid:{display:false}, border:{color:'#333'} };
+  const yFmt  = { ticks:{color:'#555',font:{size:11},callback:v=>fmt(v)}, grid:{color:'rgba(255,255,255,.04)'}, border:{color:'#333'} };
 
-  // Ingresos histórico bar
   mkChart('c-acu-bar', {
     type: 'bar',
     data: { labels: allMeses, datasets: [{ data: allIngresos, backgroundColor: barColors, borderRadius: 2 }] },
-    options: { ...baseOpts, scales: {
-      x: { ticks:{color:'#555',font:{size:9},maxRotation:60,autoSkip:true,maxTicksLimit:24}, grid:{display:false}, border:{color:'#333'} },
-      y: { ticks:{color:'#555',font:{size:11},callback:v=>fmt(v)}, grid:{color:'rgba(255,255,255,.04)'}, border:{color:'#333'} }
-    }}
+    options: { ...baseOpts, scales: { x: xAxis, y: yFmt }}
   });
 
-  // Cumulative line
+  mkChart('c-acu-mrr', {
+    type: 'line',
+    data: { labels: allMeses, datasets: [{ data: mrrEvolution, borderColor: COLORS.teal, backgroundColor:'rgba(93,202,165,.1)', fill:true, tension:.4, pointRadius:2, pointBackgroundColor: COLORS.teal }] },
+    options: { ...baseOpts, scales: { x: xAxis, y: yFmt }}
+  });
+
   mkChart('c-acu-cum', {
     type: 'line',
     data: { labels: allMeses, datasets: [{ data: cumLine, borderColor: COLORS.green, backgroundColor:'rgba(29,158,117,.08)', fill:true, tension:.4, pointRadius:2, pointBackgroundColor: COLORS.green }] },
+    options: { ...baseOpts, scales: { x: xAxis, y: yFmt }}
+  });
+
+  mkChart('c-acu-churn', {
+    type: 'line',
+    data: { labels: allMeses.slice(1), datasets: [{ data: churnRates, borderColor: COLORS.coral, backgroundColor:'rgba(216,90,48,.1)', fill:true, tension:.35, pointRadius:3, pointBackgroundColor: COLORS.coral }] },
     options: { ...baseOpts, scales: {
-      x: { ticks:{color:'#555',font:{size:9},maxRotation:60,autoSkip:true,maxTicksLimit:24}, grid:{display:false}, border:{color:'#333'} },
-      y: { ticks:{color:'#555',font:{size:11},callback:v=>fmt(v)}, grid:{color:'rgba(255,255,255,.04)'}, border:{color:'#333'} }
+      x: xAxis,
+      y: { min:0, ticks:{color:'#555',font:{size:11},callback:v=>v+'%'}, grid:{color:'rgba(255,255,255,.04)'}, border:{color:'#333'} }
     }}
   });
 
-  // Margen histórico
   mkChart('c-acu-mrg', {
     type: 'line',
     data: { labels: allMeses, datasets: [{ data: allMargen, borderColor: COLORS.purple, backgroundColor:'rgba(127,119,221,.08)', fill:true, tension:.35, pointRadius:2, pointBackgroundColor: COLORS.purple }] },
     options: { ...baseOpts, scales: {
-      x: { ticks:{color:'#555',font:{size:9},maxRotation:60,autoSkip:true,maxTicksLimit:24}, grid:{display:false}, border:{color:'#333'} },
+      x: xAxis,
       y: { min:0, max:100, ticks:{color:'#555',font:{size:11},callback:v=>v+'%'}, grid:{color:'rgba(255,255,255,.04)'}, border:{color:'#333'} }
     }}
   });
 
-  // Resultado vs dividendos
   mkChart('c-acu-div', {
     type: 'bar',
     data: { labels: allMeses, datasets: [
       { label:'Resultado', data: allRes, backgroundColor: COLORS.green+'55', borderRadius:2 },
       { label:'Dividendos', data: allDivs, type:'line', borderColor: COLORS.amber, backgroundColor:'transparent', tension:.35, pointRadius:2, pointBackgroundColor: COLORS.amber }
     ]},
-    options: { ...baseOpts, scales: {
-      x: { ticks:{color:'#555',font:{size:9},maxRotation:60,autoSkip:true,maxTicksLimit:24}, grid:{display:false}, border:{color:'#333'} },
-      y: { ticks:{color:'#555',font:{size:11},callback:v=>fmt(v)}, grid:{color:'rgba(255,255,255,.04)'}, border:{color:'#333'} }
-    }}
+    options: { ...baseOpts, scales: { x: xAxis, y: yFmt }}
   });
 
-  // Revenue por cliente (horizontal)
-  const clientMap = {};
-  years.forEach(y => {
-    Object.entries(DATA[y].ingresoClientes).forEach(([c,v]) => { clientMap[c]=(clientMap[c]||0)+v; });
-  });
-  const sorted = Object.entries(clientMap).sort((a,b)=>b[1]-a[1]);
+  // LTV por cliente
+  const sortedByLTV = [...allClients].sort((a,b) => cliMetrics[b].ltv - cliMetrics[a].ltv);
   mkChart('c-acu-cli', {
     type: 'bar',
-    data: { labels: sorted.map(e=>e[0]), datasets:[{ data: sorted.map(e=>Math.round(e[1])), backgroundColor: CLIENT_COLORS.slice(0,sorted.length), borderRadius:4 }] },
+    data: { labels: sortedByLTV, datasets:[{ data: sortedByLTV.map(c=>Math.round(cliMetrics[c].ltv)), backgroundColor: CLIENT_COLORS.slice(0,sortedByLTV.length), borderRadius:4 }] },
     options: { indexAxis:'y', ...baseOpts, scales: {
       x: { ticks:{color:'#555',font:{size:11},callback:v=>fmt(v)}, grid:{color:'rgba(255,255,255,.04)'}, border:{color:'#333'} },
       y: { ticks:{color:'#aaa',font:{size:11}}, grid:{display:false}, border:{color:'#333'} }
@@ -1742,11 +1889,9 @@ function renderAcumuladoCharts() {
   // Dividendos donut
   const divSocios = {};
   years.forEach(y => { Object.entries(DATA[y].dividendos).forEach(([s,arr])=>{ divSocios[s]=(divSocios[s]||0)+sum(arr); }); });
-  const divLabels = Object.keys(divSocios);
-  const divVals   = Object.values(divSocios);
   mkChart('c-acu-div-donut', {
     type: 'doughnut',
-    data: { labels: divLabels, datasets:[{ data: divVals, backgroundColor:[COLORS.amber, COLORS.pink], borderWidth:0 }] },
+    data: { labels: Object.keys(divSocios), datasets:[{ data: Object.values(divSocios), backgroundColor:[COLORS.amber, COLORS.pink], borderWidth:0 }] },
     options: { responsive:true, maintainAspectRatio:false, plugins:{legend:{display:false}}, cutout:'65%' }
   });
 }
