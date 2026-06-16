@@ -411,7 +411,7 @@
 const SHEET_ID   = '1ThZvjoiw2J8-mSoPnvfYJyh9kHl2S3Rs';
 const PUB_ID     = '2PACX-1vQQO91QfJekMVd2NLxTH8kKzDVR7K07amQmOnex5WKgbbny9kAGlIxp1Avc7FGg9g';
 // GIDs de las pestañas del archivo (obtener de la URL #gid=XXXX al clickear cada pestaña)
-const SHEET_GIDS = ['710974663', 'GID_2025', 'GID_2024']; // reemplazar GID_2025 y GID_2024
+const SHEET_GIDS = ['710974663', '892797536', '883545301'];
 // ────────────────────────────────────────────────────────────────────────────
 
 const COLORS = {
@@ -606,8 +606,8 @@ async function fetchSheetData() {
 function parseRowsIntoData(rowsByGID) {
   const GID_YEAR = {
     '710974663': 2026,
-    'GID_2025':  2025,
-    'GID_2024':  2024,
+    '892797536': 2025,
+    '883545301': 2024,
   };
 
   const MONTH_ES    = ['Enero','Febrero','Marzo','Abril','Mayo','Junio',
