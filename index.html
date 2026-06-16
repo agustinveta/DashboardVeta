@@ -545,37 +545,26 @@ async function fetchGID(gid) {
 }
 
 // Minimal CSV parser (handles quoted commas)
+// Parse TSV (tab-separated) — el sheet exporta tabs, no comas
 function parseCSV(text) {
-  return text.trim().split('\n').map(line => {
-    const cols = []; let cur = ''; let inQ = false;
-    for (let i = 0; i < line.length; i++) {
-      const ch = line[i];
-      if (ch === '"') { inQ = !inQ; }
-      else if (ch === ',' && !inQ) { cols.push(cur.trim()); cur = ''; }
-      else { cur += ch; }
-    }
-    cols.push(cur.trim());
-    return cols;
-  });
+  return text.trim().split('\n').map(line =>
+    line.split('\t').map(c => c.trim())
+  );
 }
 
-// Clean a cell value to a number (handles $ . , formatting)
+// Limpiar número: saca $, spaces, puntos de miles, comas decimales, %
 function cleanNum(s) {
-  if (!s) return 0;
-  const n = parseFloat(String(s).replace(/[^0-9.\-]/g, ''));
+  if (!s || s === '#DIV/0!' || s === '-') return 0;
+  // Maneja formato argentino: $ 11,817,407 -> 11817407
+  const clean = String(s)
+    .replace(/[^0-9.\-]/g, '')   // saca todo salvo dígitos, punto y menos
+    .replace(/\.(?=.*\.)/g, ''); // si hay múltiples puntos, saca todos menos el último
+  const n = parseFloat(clean);
   return isNaN(n) ? 0 : n;
 }
 
-// Find row index where col A matches keyword (case-insensitive partial)
 function findRow(rows, keyword) {
   return rows.findIndex(r => r[0] && r[0].toLowerCase().includes(keyword.toLowerCase()));
-}
-
-// Extract 12 monthly values from a row starting at col index 1
-function extractMonths(rows, keyword, numMonths) {
-  const idx = findRow(rows, keyword);
-  if (idx < 0) return Array(numMonths).fill(0);
-  return Array.from({length: numMonths}, (_, i) => cleanNum(rows[idx][i + 1]));
 }
 
 async function fetchSheetData() {
@@ -593,8 +582,7 @@ async function fetchSheetData() {
     const bestGID = Object.keys(allRows).sort((a,b) => allRows[b].length - allRows[a].length)[0];
     if (!bestGID) throw new Error('No se pudo obtener ninguna pestaña');
 
-    const rows = allRows[bestGID];
-    parseRowsIntoData(rows);
+    parseRowsIntoData(allRows); // pass all GIDs so each year is parsed
 
     usingLive = true;
     const now = new Date();
@@ -613,115 +601,149 @@ async function fetchSheetData() {
   }
 }
 
-// Parse the raw rows CSV into DATA structure
-// The sheet has 3 sections separated by blank rows: 2026, 2025, 2024
-function parseRowsIntoData(rows) {
-  // Find year section start rows by scanning for "Real" or year markers
-  const sections = {};
-  let currentYearSection = null;
-  let sectionStart = {};
+// Parser exacto para la estructura real del sheet
+// Columnas: A=Label, B=Enero, C=Febrero ... M=Diciembre, N=vacía, O=Anual
+// La pestaña tiene UNA sola sección (2026 YTD) — los otros años están en otras pestañas
+// GIDs: 710974663=2026, necesitamos también los de 2025 y 2024
+function parseRowsIntoData(rowsByGID) {
+  // Mapa de GID a año — ajustar si los GIDs cambian
+  const GID_YEAR = {
+    '710974663': 2026,
+    '0': 2025,
+  };
 
-  for (let i = 0; i < rows.length; i++) {
-    const cell = (rows[i][0] || '').trim();
-    if (cell.includes('2026')) { currentYearSection = 2026; sectionStart[2026] = i; }
-    else if (cell.includes('2025') && !cell.includes('Planeado')) { currentYearSection = 2025; sectionStart[2025] = i; }
-    else if (cell.includes('2024')) { currentYearSection = 2024; sectionStart[2024] = i; }
-  }
+  const MONTH_ES = ['Enero','Febrero','Marzo','Abril','Mayo','Junio',
+                    'Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+  const MONTH_SHORT = ['Ene','Feb','Mar','Abr','May','Jun',
+                       'Jul','Ago','Sep','Oct','Nov','Dic'];
 
-  // For each year, extract a slice of rows and parse
-  const yearList = [2026, 2025, 2024];
-  const yearKeys = Object.keys(sectionStart).map(Number).sort((a,b) => b-a);
+  Object.entries(rowsByGID).forEach(([gid, rows]) => {
+    const year = GID_YEAR[gid];
+    if (!year) return;
 
-  for (let yi = 0; yi < yearKeys.length; yi++) {
-    const y = yearKeys[yi];
-    const startRow = sectionStart[y];
-    const endRow   = yi + 1 < yearKeys.length ? sectionStart[yearKeys[yi+1]] : rows.length;
-    const slice    = rows.slice(startRow, endRow);
+    // 1. Encontrar la fila header con los meses (fila que diga "Real" en col A)
+    const headerIdx = rows.findIndex(r =>
+      r[0] && r[0].trim().toLowerCase() === 'real'
+    );
+    if (headerIdx < 0) { console.warn('No encontré fila Real para GID', gid); return; }
 
-    // Detect months from header row (row after "Real")
-    const headerIdx = slice.findIndex(r => r[0] && (r[0].trim() === 'Real' || r[0].trim().toLowerCase().includes('real')));
-    if (headerIdx < 0) continue;
-    const headerRow = slice[headerIdx];
-
-    const MONTH_ES = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
-    const MONTH_SHORT = ['Ene','Feb','Mar','Abr','May','Jun','Jul','Ago','Sep','Oct','Nov','Dic'];
+    const headerRow = rows[headerIdx];
     const meses = [];
-    const colOffsets = [];
+    const colIdx = []; // índices de columna que corresponden a meses
+
     for (let c = 1; c < headerRow.length; c++) {
       const v = (headerRow[c] || '').trim();
-      const idx = MONTH_ES.findIndex(m => m.toLowerCase() === v.toLowerCase());
-      if (idx >= 0) { meses.push(MONTH_SHORT[idx]); colOffsets.push(c); }
+      const mi = MONTH_ES.findIndex(m => m.toLowerCase() === v.toLowerCase());
+      if (mi >= 0) { meses.push(MONTH_SHORT[mi]); colIdx.push(c); }
     }
-    if (meses.length === 0) continue;
+    if (meses.length === 0) { console.warn('No encontré meses en GID', gid); return; }
 
     const N = meses.length;
 
-    function extractCols(keyword) {
-      const ri = slice.findIndex(r => r[0] && r[0].toLowerCase().includes(keyword.toLowerCase()));
+    // Helper: extraer valores de N meses de una fila que matchea keyword
+    function extractRow(keyword) {
+      const ri = rows.findIndex(r =>
+        r[0] && r[0].trim().toLowerCase().includes(keyword.toLowerCase())
+      );
       if (ri < 0) return Array(N).fill(0);
-      return colOffsets.map(c => cleanNum(slice[ri][c]));
+      return colIdx.map(c => cleanNum(rows[ri][c]));
     }
 
-    // Client rows: everything between "Ingresos Operativos" and "Otros ingresos"
-    const ingOpIdx  = slice.findIndex(r => r[0] && r[0].toLowerCase().includes('ingresos operativos'));
-    const otrosIdx  = slice.findIndex(r => r[0] && r[0].toLowerCase().includes('otros ingresos'));
-    const clientRows = (ingOpIdx >= 0 && otrosIdx > ingOpIdx)
-      ? slice.slice(ingOpIdx + 1, otrosIdx).filter(r => r[0] && r[0].trim() !== '')
-      : [];
+    // 2. Métricas principales
+    const ingresos  = extractRow('Ingresos Operativos');
+    const costos    = extractRow('Costos Operativos');
+    const resultado = extractRow('Resultado Neto');
+
+    // Margen: viene como "74%" → convertir a número
+    const margenRow = rows.findIndex(r => r[0] && r[0].trim().toLowerCase().includes('margen neto'));
+    const margen = margenRow >= 0
+      ? colIdx.map(c => {
+          const v = (rows[margenRow][c] || '').trim();
+          if (!v || v.includes('DIV') || v === '') return 0;
+          // "74%" → 74, "0.74" → 74
+          const n = parseFloat(v.replace('%','').replace(',','.'));
+          return isNaN(n) ? 0 : (n < 1 ? Math.round(n * 100) : Math.round(n));
+        })
+      : Array(N).fill(0);
+
+    // 3. Clientes: filas entre "Ingresos Operativos" y "Otros ingresos" / "Ingresos No Operativos"
+    const ingOpIdx  = rows.findIndex(r => r[0] && r[0].trim().toLowerCase() === 'ingresos operativos');
+    const stopKeywords = ['otros ingresos', 'ingresos no operativos'];
+    let clientEndIdx = rows.length;
+    for (let i = ingOpIdx + 1; i < rows.length; i++) {
+      if (stopKeywords.some(k => (rows[i][0]||'').toLowerCase().includes(k))) {
+        clientEndIdx = i; break;
+      }
+    }
 
     const clientes = {};
     const ingresoClientes = {};
-    clientRows.forEach(r => {
-      const name = r[0].trim();
-      if (!name || name.toLowerCase().includes('total') || name.toLowerCase().includes('ingresos')) return;
-      const vals = colOffsets.map(c => cleanNum(r[c]));
-      clientes[name] = vals.map(v => v > 0 ? 1 : 0);
-      ingresoClientes[name] = vals.reduce((a,b)=>a+b, 0);
-    });
-
-    // Salary rows: between "Costos Operativos" and "Resultado sin dividendos"
-    const costOpIdx = slice.findIndex(r => r[0] && r[0].toLowerCase().includes('costos operativos'));
-    const resSinDivIdx = slice.findIndex(r => r[0] && r[0].toLowerCase().includes('resultado sin dividendos'));
-    const SALARY_KEYWORDS = ['account', 'perfo', 'redes', 'honorarios', 'contador'];
-    const sueldos = {};
-    if (costOpIdx >= 0 && resSinDivIdx > costOpIdx) {
-      slice.slice(costOpIdx + 1, resSinDivIdx).forEach(r => {
+    if (ingOpIdx >= 0) {
+      rows.slice(ingOpIdx + 1, clientEndIdx).forEach(r => {
         const name = (r[0] || '').trim();
         if (!name) return;
         const lname = name.toLowerCase();
-        if (SALARY_KEYWORDS.some(k => lname.includes(k))) {
-          sueldos[name] = colOffsets.map(c => cleanNum(r[c]));
+        if (lname.includes('ingresos') || lname.includes('total') || lname.includes('otros')) return;
+        const vals = colIdx.map(c => cleanNum(r[c]));
+        const totalCli = vals.reduce((a,b)=>a+b,0);
+        if (totalCli === 0 && vals.every(v=>v===0)) return; // skip empty rows
+        clientes[name] = vals.map(v => v > 0 ? 1 : 0);
+        ingresoClientes[name] = totalCli;
+      });
+    }
+
+    // 4. Sueldos: filas entre "Costos Operativos" y "Resultado sin dividendos"
+    const costOpIdx    = rows.findIndex(r => r[0] && r[0].trim().toLowerCase() === 'costos operativos');
+    const resSinDivIdx = rows.findIndex(r => r[0] && r[0].trim().toLowerCase().includes('resultado sin dividendos'));
+    const SALARY_KW = ['account', 'perfo', 'redes', 'honorarios', 'contador'];
+    const sueldos = {};
+    if (costOpIdx >= 0 && resSinDivIdx > costOpIdx) {
+      rows.slice(costOpIdx + 1, resSinDivIdx).forEach(r => {
+        const name = (r[0] || '').trim();
+        if (!name) return;
+        if (SALARY_KW.some(k => name.toLowerCase().includes(k))) {
+          const vals = colIdx.map(c => cleanNum(r[c]));
+          if (vals.some(v => v > 0)) sueldos[name] = vals;
         }
       });
     }
 
-    // Dividend rows
+    // 5. Dividendos: filas que empiezan con "Dividendos "
     const dividendos = {};
-    slice.forEach(r => {
+    rows.forEach(r => {
       const name = (r[0] || '').trim();
-      if (name.toLowerCase().startsWith('dividendos ')) {
-        const socio = name.replace(/^dividendos\s+/i, '');
-        dividendos[socio] = colOffsets.map(c => cleanNum(r[c]));
+      if (/^dividendos\s+/i.test(name)) {
+        const socio = name.replace(/^dividendos\s+/i, '').trim();
+        const vals = colIdx.map(c => cleanNum(r[c]));
+        if (vals.some(v => v > 0)) dividendos[socio] = vals;
       }
     });
 
-    DATA[y] = {
+    // 6. Guardar — si resultado viene en 0 intentar calcular
+    const resultadoFinal = resultado.some(v=>v>0)
+      ? resultado
+      : ingresos.map((v,i) => v - costos[i]);
+
+    DATA[year] = {
       meses,
-      ingresos:  extractCols('ingresos operativos'),
-      costos:    extractCols('costos operativos'),
-      resultado: extractCols('resultado neto'),
-      margen:    extractCols('margen neto').map(v => typeof v === 'number' && v < 1 && v > 0 ? Math.round(v * 100) : Math.round(v)),
-      clientes,
-      ingresoClientes,
-      sueldos:   Object.keys(sueldos).length > 0 ? sueldos : FALLBACK[y].sueldos,
-      dividendos: Object.keys(dividendos).length > 0 ? dividendos : FALLBACK[y].dividendos,
+      ingresos,
+      costos,
+      resultado: resultadoFinal,
+      margen,
+      clientes:  Object.keys(clientes).length  > 0 ? clientes  : FALLBACK[year].clientes,
+      ingresoClientes: Object.keys(ingresoClientes).length > 0 ? ingresoClientes : FALLBACK[year].ingresoClientes,
+      sueldos:   Object.keys(sueldos).length   > 0 ? sueldos   : FALLBACK[year].sueldos,
+      dividendos: Object.keys(dividendos).length > 0 ? dividendos : FALLBACK[year].dividendos,
     };
 
-    // If parsing gave mostly zeros, fall back to hardcoded
-    if (sum(DATA[y].ingresos) === 0) {
-      DATA[y] = JSON.parse(JSON.stringify(FALLBACK[y]));
+    // Sanity check: si ingresos son todos cero, usar fallback
+    if (sum(DATA[year].ingresos) === 0) {
+      console.warn('Parser dio ceros para año', year, '— usando fallback');
+      DATA[year] = JSON.parse(JSON.stringify(FALLBACK[year]));
+    } else {
+      console.log('✓ Año', year, '— meses:', meses.join(', '), '— ingresos:', sum(DATA[year].ingresos));
     }
-  }
+  });
 }
 
 function setStatus(live, text) {
@@ -1916,9 +1938,19 @@ function setYear(y) {
 }
 
 // ─── INIT ──────────────────────────────────────────────────────────────────
+const REFRESH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutos
+
 async function init() {
   await fetchSheetData();
   render();
+  // Auto-refresh: refetch datos y re-render cada 5 min
+  setInterval(async () => {
+    const ok = await fetchSheetData();
+    if (ok) {
+      render();
+      console.log('Dashboard actualizado desde Sheets', new Date().toLocaleTimeString());
+    }
+  }, REFRESH_INTERVAL_MS);
 }
 
 init();
